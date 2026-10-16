@@ -240,6 +240,8 @@ export interface PruneProtections {
   pathGlobs: string[];
   /** Number of most recent conversational turns left untouched. */
   recentTurns: number;
+  /** Cap the turn-based window by message count; 0 preserves turn-only behavior. */
+  recentMessages: number;
 }
 
 export interface PruneThresholds {
@@ -268,6 +270,8 @@ export interface StrategiesConfig {
   };
   /** Superseded file-ops strategy: stale read/write/edit outputs replaced by a placeholder. */
   supersededFileOps: { enabled: boolean };
+  /** Large old text outputs are eligible only immediately after compaction. */
+  staleOutput: { enabled: boolean; toolNames: string[]; minChars: number };
 }
 
 export type GateMode = "on" | "off" | "always-apply";
@@ -312,6 +316,7 @@ export function defaultConfig(): DynamicContextPruningConfig {
       toolNames: [...DEFAULT_PROTECTED_TOOL_NAMES],
       pathGlobs: [...DEFAULT_PROTECTED_PATH_GLOBS],
       recentTurns: DEFAULT_RECENT_TURNS,
+      recentMessages: 40,
     },
     thresholds: {
       minCharsSaved: DEFAULT_MIN_CHARS_SAVED,
@@ -320,6 +325,7 @@ export function defaultConfig(): DynamicContextPruningConfig {
       dedupe: { enabled: true },
       errorPurge: { enabled: true, minTurnsOld: DEFAULT_ERROR_PURGE_MIN_TURNS_OLD },
       supersededFileOps: { enabled: true },
+      staleOutput: { enabled: true, toolNames: ["bash", "read"], minChars: 2000 },
     },
     gate: {
       mode: "on",
@@ -402,12 +408,20 @@ export function normalizeConfig(parsed: unknown): DynamicContextPruningConfig {
       : {}
   ) as Record<string, unknown>;
 
+  const rawStaleOutput = (
+    isRecord(rawStrategies.staleOutput) ? rawStrategies.staleOutput : {}
+  ) as Record<string, unknown>;
+
   return {
     enabled: typeof raw.enabled === "boolean" ? raw.enabled : defaults.enabled,
     protections: {
       toolNames: asStringArray(rawProtections.toolNames, defaults.protections.toolNames),
       pathGlobs: asStringArray(rawProtections.pathGlobs, defaults.protections.pathGlobs),
       recentTurns: asNonNegativeInt(rawProtections.recentTurns, defaults.protections.recentTurns),
+      recentMessages: asNonNegativeInt(
+        rawProtections.recentMessages,
+        defaults.protections.recentMessages,
+      ),
     },
     thresholds: {
       minCharsSaved: asNonNegativeInt(
@@ -428,6 +442,17 @@ export function normalizeConfig(parsed: unknown): DynamicContextPruningConfig {
         enabled: asBoolean(
           rawSupersededFileOps.enabled,
           defaults.strategies.supersededFileOps.enabled,
+        ),
+      },
+      staleOutput: {
+        enabled: asBoolean(rawStaleOutput.enabled, defaults.strategies.staleOutput.enabled),
+        toolNames: asStringArray(
+          rawStaleOutput.toolNames,
+          defaults.strategies.staleOutput.toolNames,
+        ),
+        minChars: asNonNegativeInt(
+          rawStaleOutput.minChars,
+          defaults.strategies.staleOutput.minChars,
         ),
       },
     },
@@ -652,20 +677,34 @@ export function collectArgStringValues(
  * Index of the first message index considered part of the "recent" protected
  * window. Messages at or after this index must never be pruned.
  *
- * A "turn" starts at each user message. Protects the last `recentTurns` turns.
+ * A "turn" starts at each user message. An optional message cap prevents a
+ * single long-running user request from protecting its entire tool history.
  */
 export function computeRecencyBoundaryIndex(
   messages: MinimalMessage[],
   recentTurns: number,
+  recentMessages = 0,
 ): number {
   if (recentTurns <= 0) return messages.length;
   const turnStarts: number[] = [];
   messages.forEach((message, index) => {
     if (message.role === "user") turnStarts.push(index);
   });
-  if (turnStarts.length === 0) return 0;
   const startIdx = Math.max(0, turnStarts.length - recentTurns);
-  return turnStarts[startIdx] ?? 0;
+  const turnBoundary = turnStarts[startIdx] ?? 0;
+  return recentMessages > 0
+    ? Math.max(turnBoundary, messages.length - recentMessages)
+    : turnBoundary;
+}
+
+/** Compaction invalidates the prefix; metadata and restart do not warm it. */
+export function isCacheColdBranch(entries: MinimalSessionEntry[]): boolean {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type === "compaction") return true;
+    if (entry.type === "message" && entry.message?.role === "assistant") return false;
+  }
+  return false;
 }
 
 export function isWithinRecencyWindow(index: number, boundaryIndex: number): boolean {
@@ -1494,6 +1533,8 @@ export interface StrategyProposeInput {
    * normalization only) rather than throw.
    */
   cwd?: string;
+  /** True only between a persisted compaction and its first assistant reply. */
+  cacheCold?: boolean;
 }
 
 export interface PruneStrategy {
@@ -1901,6 +1942,30 @@ export const supersededFileOpsStrategy: PruneStrategy = {
   },
 };
 
+export const staleOutputStrategy: PruneStrategy = {
+  id: "stale-output",
+  propose(input: StrategyProposeInput): ProposedPrune[] {
+    const config = input.config.strategies.staleOutput;
+    if (!input.cacheCold || !config?.enabled) return [];
+    const names = new Set(config.toolNames.map((name) => name.trim().toLowerCase()));
+    const proposals: ProposedPrune[] = [];
+    for (const occurrence of collectCompletedToolCallOccurrences(input.messages)) {
+      if (!names.has(occurrence.toolName.trim().toLowerCase())) continue;
+      const result = input.messages[occurrence.resultIndex] as MinimalToolResultMessage;
+      if (!Array.isArray(result.content) || result.content.some((block) => block.type !== "text"))
+        continue;
+      if (contentTextLength(result.content) < config.minChars) continue;
+      proposals.push({
+        strategyId: "stale-output",
+        toolCallId: occurrence.toolCallId,
+        kind: "tool_result_content",
+        reason: "large old tool output after compaction",
+      });
+    }
+    return proposals;
+  },
+};
+
 /**
  * Strategies PROPOSE prunes; only this pipeline ever APPLIES them.
  */
@@ -1908,6 +1973,7 @@ export const STRATEGIES: PruneStrategy[] = [
   dedupeStrategy,
   errorPurgeStrategy,
   supersededFileOpsStrategy,
+  staleOutputStrategy,
 ];
 
 function collectProposals(input: StrategyProposeInput): ProposedPrune[] {
@@ -1943,6 +2009,8 @@ export interface PipelineInput {
   agentState?: AgentState;
   /** Session working directory, forwarded to strategies for path normalization. */
   cwd?: string;
+  /** Absent means warm; does not bypass the minimum-savings or net-benefit gate. */
+  cacheCold?: boolean;
 }
 
 export interface PipelineResult {
@@ -1992,6 +2060,7 @@ export function runDynamicContextPruningPipeline(input: PipelineInput): Pipeline
   const recencyBoundaryIndex = computeRecencyBoundaryIndex(
     messages,
     input.config.protections.recentTurns,
+    input.config.protections.recentMessages,
   );
   // Built once and reused across all protection/savings/apply checks below so
   // each per-decision lookup is O(1) instead of an O(n) rescan of `messages`.
@@ -2004,6 +2073,7 @@ export function runDynamicContextPruningPipeline(input: PipelineInput): Pipeline
     messages,
     config: input.config,
     cwd: input.cwd,
+    cacheCold: input.cacheCold,
   });
 
   const seenKeys = new Set(input.persistedDecisions.map((decision) => decision.idempotencyKey));
@@ -2326,7 +2396,7 @@ export function formatPrunableItemsReport(items: PrunableItem[]): string[] {
   return items.map((item, index) => `${index + 1}. ${formatPrunableItemOption(item)}`);
 }
 
-export type StrategyKey = "dedupe" | "errorPurge" | "supersededFileOps";
+export type StrategyKey = "dedupe" | "errorPurge" | "supersededFileOps" | "staleOutput";
 
 const STRATEGY_ALIASES: Record<string, StrategyKey> = {
   dedupe: "dedupe",
@@ -2338,12 +2408,17 @@ const STRATEGY_ALIASES: Record<string, StrategyKey> = {
   supersededfileops: "supersededFileOps",
   superseded_file_ops: "supersededFileOps",
   supersededFileOps: "supersededFileOps",
+  "stale-output": "staleOutput",
+  staleoutput: "staleOutput",
+  stale_output: "staleOutput",
+  staleOutput: "staleOutput",
 };
 
 const STRATEGY_DISPLAY_NAMES: Record<StrategyKey, string> = {
   dedupe: "dedupe",
   errorPurge: "error-purge",
   supersededFileOps: "superseded-file-ops",
+  staleOutput: "stale-output",
 };
 
 export type ContextPruningSubcommand =
@@ -2405,7 +2480,7 @@ export function contextPruningUsage(): string {
     "  status                        Show enabled state, strategies, protections, and context size.",
     "  stats                         Show cumulative tokens saved per strategy.",
     "  on | off | toggle             Enable/disable dynamic context pruning entirely.",
-    "  strategy <name> on|off        Toggle one strategy: dedupe | error-purge | superseded-file-ops.",
+    "  strategy <name> on|off        Toggle one strategy: dedupe | error-purge | superseded-file-ops | stale-output.",
     "  gate on|off|always-apply      Control the net-benefit gate: reject/bypass/model-only.",
   ].join("\n");
 }
@@ -2478,7 +2553,10 @@ export function formatStatusReport(input: StatusReportInput): string[] {
     `  superseded-file-ops: ${config.strategies.supersededFileOps.enabled ? "on" : "off"}`,
   );
   lines.push(
-    `Protections: recentTurns=${config.protections.recentTurns}, protectedTools=${config.protections.toolNames.length}, protectedPathGlobs=${config.protections.pathGlobs.length}`,
+    `  stale-output: ${config.strategies.staleOutput.enabled ? "on" : "off"} (after compaction only)`,
+  );
+  lines.push(
+    `Protections: recentTurns=${config.protections.recentTurns}, recentMessages=${config.protections.recentMessages}, protectedTools=${config.protections.toolNames.length}, protectedPathGlobs=${config.protections.pathGlobs.length}`,
   );
   if (lastSnapshot) {
     lines.push(
@@ -2576,6 +2654,10 @@ export default function dynamicContextPruningExtension(pi: ExtensionAPI) {
       restoredIdempotencyKeys,
       agentState: classifyAgentStateFromMessages(event.messages as unknown as MinimalMessage[]),
       cwd: ctx.sessionManager.getCwd(),
+      // SAFETY: Pi branch entries provide the type/message fields inspected by this structural reader.
+      cacheCold: isCacheColdBranch(
+        ctx.sessionManager.getBranch() as unknown as MinimalSessionEntry[],
+      ),
     });
 
     for (const decision of result.newlyAppliedDecisions) {

@@ -26,7 +26,7 @@ and why it hasn't been built yet.
   idempotency key. The most recent entry (by chronological order) for a given
   key wins when replaying history, so a decision can be pruned, restored, and
   re-pruned any number of times.
-- **Recomputed every call, not on a timer.** All three automatic strategies run
+- **Recomputed every call, not on a timer.** All four automatic strategies run
   fresh on every `context` event, over the current message array. Pi 0.99's
   `context` hook intentionally receives the mutable conversation without system
   messages; Pi restores its system prompt and tool state after the handler. The
@@ -47,7 +47,7 @@ and why it hasn't been built yet.
 
 ## Strategies
 
-Three deterministic strategies propose prunes; each can be toggled independently.
+Four deterministic strategies propose prunes; each can be toggled independently.
 
 ### 1. Deduplication (`dedupe`)
 
@@ -103,6 +103,22 @@ and `filePath` argument names, matched only against pi's built-in
 `read`/`write`/`edit` tools; `bash` file writes are out of scope (this
 strategy does not parse shell commands).
 
+### 4. Old large outputs after compaction (`stale-output`)
+
+After a persisted compaction, old text-only `bash` and `read` results of at least
+2000 characters can be proposed even when no later call supersedes them. This
+eligibility ends at the first subsequent assistant message. The signal is rebuilt
+from the active session branch, so a restart does not invent or lose it. Ordinary
+warm turns, branch summaries, elapsed time and model changes are not cold signals.
+Image-bearing results are skipped. Earlier strategies retain priority when they
+propose the same target. Configure `strategies.staleOutput` or use
+`/context-pruning strategy stale-output off` to disable this strategy.
+
+The existing recency, protected-tool/path, minimum-saving and net-benefit checks
+still apply. In particular, cache-cold eligibility does not override the conservative
+mid-loop gate or promise a particular pruning percentage. Decisions already accepted
+replay on warm calls until restored; `/prune` and restore retain their existing behavior.
+
 ## Protections
 
 Before any strategy is allowed to propose a prune, several protections apply:
@@ -114,8 +130,11 @@ Before any strategy is allowed to propose a prune, several protections apply:
   `**/.env`, `**/.env.*`, `**/*.pem`, `**/*.key`, `**/id_rsa*`,
   `**/id_ed25519*`, `**/secrets/**`, `**/*.p12`, `**/*.pfx`.
 - **Recency window**: the most recent `recentTurns` conversational turns
-  (default `4`) are never touched by any automatic strategy, regardless of
-  what they contain.
+  (default `4`) are protected, capped at `recentMessages` messages (default `40`).
+  This prevents one long-running user request from protecting all its old tool
+  history. A tool call/result pair is protected when either member is inside the
+  recent window. Set `recentMessages` to `0` for the previous turn-only behavior;
+  `recentTurns: 0` continues to disable recency protection.
 
 All three lists/values are configurable (see [Configuration](#configuration)).
 
@@ -221,7 +240,8 @@ never required to exist. Full shape, with defaults:
   "protections": {
     "toolNames": ["todo", "task", "subagent", "agent", "skill", "oracle", "librarian", "contrarian", "code_reviewer", "gnosis", "triage_comments"],
     "pathGlobs": ["**/.env", "**/.env.*", "**/*.pem", "**/*.key", "**/id_rsa*", "**/id_ed25519*", "**/secrets/**", "**/*.p12", "**/*.pfx"],
-    "recentTurns": 4
+    "recentTurns": 4,
+    "recentMessages": 40
   },
   "thresholds": {
     "minCharsSaved": 200
@@ -229,7 +249,8 @@ never required to exist. Full shape, with defaults:
   "strategies": {
     "dedupe": { "enabled": true },
     "errorPurge": { "enabled": true, "minTurnsOld": 4 },
-    "supersededFileOps": { "enabled": true }
+    "supersededFileOps": { "enabled": true },
+    "staleOutput": { "enabled": true, "toolNames": ["bash", "read"], "minChars": 2000 }
   },
   "gate": {
     "mode": "on",
